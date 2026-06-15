@@ -1,0 +1,44 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+env/
+.env
+.venv
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter notebook
+.ipynb_checkpoints/
+
+# Data files (prevent accidental upload of large/restricted data)
+*.xlsx
+*.xls
+*.csv
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# Result directories
+results/
+output/
+logs/
+
+# OS generated files
+Thumbs.db
+
+# mypy / pytest
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
