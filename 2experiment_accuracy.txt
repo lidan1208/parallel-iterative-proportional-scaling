@@ -1,0 +1,154 @@
+"""
+Accuracy experiment: Evaluate estimation accuracy of serial/parallel CovIPS using true graphical models.
+Data generation: generate_true_model creates true precision K0 and covariance Sigma0, then samples from N(0, Sigma0).
+"""
+import numpy as np
+import pandas as pd
+import time
+import os
+import gc
+from common import GGM_Fitter, ggm_logL
+
+
+def generate_true_model(p, density, seed=None, min_coef=0.3, max_coef=1.0, diag_extra=0.1):
+    """
+    Generate true precision matrix K0, covariance Sigma0, and edge set.
+
+    Parameters
+    ----------
+    p : int
+        Number of variables.
+    density : float
+        Graph density (proportion of edges).
+    seed : int or None
+        Random seed.
+    min_coef, max_coef : float
+        Range for non-zero partial correlations.
+    diag_extra : float
+        Extra diagonal term to ensure positive definiteness.
+
+    Returns
+    -------
+    K0 : ndarray
+        True precision matrix.
+    Sigma0 : ndarray
+        True covariance matrix.
+    emat : ndarray, shape (2, n_edges)
+        Edge matrix.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    K0 = np.zeros((p, p))
+    all_edges = [(i, j) for i in range(p) for j in range(i+1, p)]
+    n_edges = int(density * len(all_edges))
+    chosen = np.random.choice(len(all_edges), n_edges, replace=False)
+    for idx in chosen:
+        i, j = all_edges[idx]
+        val = np.random.uniform(min_coef, max_coef)
+        if np.random.rand() > 0.5:
+            val = -val
+        K0[i, j] = K0[j, i] = val
+    for i in range(p):
+        K0[i, i] = np.sum(np.abs(K0[i, :])) + diag_extra
+    Sigma0 = np.linalg.inv(K0)
+    emat = np.array([[i, j] for (i, j) in all_edges if K0[i, j] != 0]).T
+    return K0, Sigma0, emat
+
+def unified_time_accuracy_experiment(n_repeats, n_obs, n_var, densities,
+                                     parallel_eps_factor, verbose, seed=None):
+    """
+    Run accuracy and timing experiment for serial/parallel CovIPS.
+
+    Parameters
+    ----------
+    n_repeats : int
+        Number of repetitions per density.
+    n_obs : int
+        Sample size.
+    n_var : int
+        Number of variables.
+    densities : list of float
+        List of graph densities to test.
+    parallel_eps_factor : float
+        Relaxation factor for parallel convergence threshold.
+    verbose : bool
+        If True, print progress information.
+    seed : int or None
+        Base random seed (each repetition uses seed + rep).
+
+    Returns
+    -------
+    df : pandas.DataFrame
+        Results containing timing, iteration counts, errors, and KL divergence.
+    """
+    results = []
+
+    for density in densities:
+        K0, Sigma0, edges_true = generate_true_model(n_var, density, seed=42)
+        norm_K0 = np.linalg.norm(K0, 'fro')
+        norm_Sigma0 = np.linalg.norm(Sigma0, 'fro')
+        if verbose:
+            print(f"Density {density}: ||K0||_F={norm_K0:.4f}, ||Sigma0||_F={norm_Sigma0:.4f}")
+
+        for rep in range(n_repeats):
+            if seed is not None:
+                np.random.seed(seed + rep)
+            data = np.random.multivariate_normal(np.zeros(n_var), Sigma0, n_obs)
+            S = np.cov(data, rowvar=False)
+
+            # Serial
+            fitter_s = GGM_Fitter(parallel=False, verbose=False, max_iter=5000,
+                                  eps=1e-3, convcrit=1)
+            t0 = time.time()
+            res_s = fitter_s.fit(S, edges_true, n_obs)
+            serial_time = time.time() - t0
+            K_hat_s, Sigma_hat_s = res_s["K"], res_s["Sigma"]
+
+            # Parallel
+            fitter_p = GGM_Fitter(parallel=True, n_jobs=min(os.cpu_count(), 4), verbose=False,
+                                  max_iter=5000, eps=1e-3, parallel_eps_factor=parallel_eps_factor, convcrit=1)
+            t0 = time.time()
+            res_p = fitter_p.fit(S, edges_true, n_obs)
+            parallel_time = time.time() - t0
+            K_hat_p, Sigma_hat_p = res_p["K"], res_p["Sigma"]
+
+            speedup = serial_time / parallel_time if parallel_time > 0 else np.nan
+            diff_K = np.linalg.norm(K_hat_s - K_hat_p, 'fro')
+            diff_Sigma = np.linalg.norm(Sigma_hat_s - Sigma_hat_p, 'fro')
+
+            # Serial errors
+            err_K_fro_s = np.linalg.norm(K0 - K_hat_s, 'fro')
+            err_S_fro_s = np.linalg.norm(Sigma0 - Sigma_hat_s, 'fro')
+            sign_s, logdet_s = np.linalg.slogdet(Sigma0 @ K_hat_s)
+            kl_s = np.trace(Sigma0 @ K_hat_s) - logdet_s - n_var
+            rel_err_K_s = err_K_fro_s / norm_K0 if norm_K0 > 0 else np.nan
+            rel_err_S_s = err_S_fro_s / norm_Sigma0 if norm_Sigma0 > 0 else np.nan
+
+            # Parallel errors
+            err_K_fro_p = np.linalg.norm(K0 - K_hat_p, 'fro')
+            err_S_fro_p = np.linalg.norm(Sigma0 - Sigma_hat_p, 'fro')
+            sign_p, logdet_p = np.linalg.slogdet(Sigma0 @ K_hat_p)
+            kl_p = np.trace(Sigma0 @ K_hat_p) - logdet_p - n_var
+            rel_err_K_p = err_K_fro_p / norm_K0 if norm_K0 > 0 else np.nan
+            rel_err_S_p = err_S_fro_p / norm_Sigma0 if norm_Sigma0 > 0 else np.nan
+
+            results.append({
+                'density': density, 'n_obs': n_obs, 'n_var': n_var, 'rep': rep,
+                'method': 'serial', 'time': serial_time, 'iterations': res_s['iter'],
+                'err_K_fro': err_K_fro_s, 'err_S_fro': err_S_fro_s, 'kl_div': kl_s,
+                'rel_err_K_fro': rel_err_K_s, 'rel_err_S_fro': rel_err_S_s,
+                'speedup': np.nan, 'diff_K_fro': np.nan, 'diff_Sigma_fro': np.nan
+            })
+            results.append({
+                'density': density, 'n_obs': n_obs, 'n_var': n_var, 'rep': rep,
+                'method': 'parallel', 'time': parallel_time, 'iterations': res_p['iter'],
+                'err_K_fro': err_K_fro_p, 'err_S_fro': err_S_fro_p, 'kl_div': kl_p,
+                'rel_err_K_fro': rel_err_K_p, 'rel_err_S_fro': rel_err_S_p,
+                'speedup': speedup, 'diff_K_fro': diff_K, 'diff_Sigma_fro': diff_Sigma
+            })
+
+            if verbose:
+                print(f"  rep {rep}: serial={serial_time:.2f}s, iter={res_s['iter']}, "
+                      f"parallel={parallel_time:.2f}s, speedup={speedup:.2f}x")
+
+    return pd.DataFrame(results)

@@ -1,0 +1,283 @@
+"""
+Real data experiment:TCGA breast cancer dataset.
+"""
+
+
+def regularize_covariance(S, method='auto', reg_param=None, min_eigval=1e-6):
+    """
+    Apply regularization to covariance matrix to ensure positive definiteness.
+
+    Parameters
+    ----------
+    S : ndarray
+        Empirical covariance matrix.
+    method : str, optional
+        Regularization method: 'auto', 'l2', 'diagonal', 'none'.
+    reg_param : float or None
+        Regularization parameter. If None, automatically determined.
+    min_eigval : float, optional
+        Minimum allowed eigenvalue.
+
+    Returns
+    -------
+    S_reg : ndarray
+        Regularized covariance matrix.
+    reg_used : float
+        Regularization parameter used.
+    """
+    p = S.shape[0]
+    eigvals = np.linalg.eigvalsh(S)
+    min_eig = np.min(eigvals)
+    cond = np.max(eigvals) / max(min_eig, 1e-16)
+    if method == 'auto':
+        if cond > 1e6 or min_eig < min_eigval:
+            method = 'l2'
+        else:
+            method = 'none'
+    if method == 'none':
+        return S, 0.0
+    if reg_param is None:
+        if method == 'l2':
+            reg_param = max(0.0, min_eigval - min_eig) + 0.01 * np.trace(S) / p
+        elif method == 'diagonal':
+            reg_param = max(0.0, min_eigval - min_eig)
+    if method == 'l2':
+        S_reg = S + reg_param * np.eye(p)
+    elif method == 'diagonal':
+        S_reg = S.copy()
+        np.fill_diagonal(S_reg, np.maximum(np.diag(S), reg_param))
+    else:
+        S_reg = S
+    return S_reg, reg_param
+
+def load_real_data(excel_path, n_genes=None, scale_data=True,
+                   reg_method='auto', reg_param=None, min_eigval=1e-6):
+    """
+    Load gene expression data from Excel, standardize, and regularize covariance.
+
+    Parameters
+    ----------
+    excel_path : str
+        Path to Excel file containing expression data (samples x genes).
+    n_genes : int or None
+        Number of genes to use (first n_genes). If None, use all.
+    scale_data : bool
+        Whether to standardize data (mean 0, variance 1).
+    reg_method, reg_param, min_eigval : passed to regularize_covariance.
+
+    Returns
+    -------
+    X_processed : ndarray
+        Preprocessed data matrix (n_obs x p).
+    S_reg : ndarray
+        Regularized covariance matrix.
+    n_obs : int
+        Number of samples.
+    reg_used : float
+        Regularization parameter used.
+    """
+    df = pd.read_excel(excel_path)
+    if n_genes is not None and n_genes < df.shape[1]:
+        X = df.iloc[:, :n_genes].values
+    else:
+        X = df.values
+    n_obs, p = X.shape
+    if scale_data:
+        Xc = X - np.mean(X, axis=0)
+        stds = np.std(Xc, axis=0, ddof=1)
+        stds = np.where(stds < 1e-12, 1.0, stds)
+        X = Xc / stds
+    S = X.T @ X / (n_obs - 1)
+    S_reg, reg_used = regularize_covariance(S, method=reg_method,
+                                            reg_param=reg_param, min_eigval=min_eigval)
+    return X, S_reg, n_obs, reg_used
+
+def real_data_table1_experiment(data_params, graph_params, algorithm_params,
+                                debug=False, seed=None):
+    """
+    Run serial and parallel CovIPS on random graphs derived from real data.
+
+    Parameters
+    ----------
+    data_params : dict
+        Parameters for load_real_data: 'excel_path', 'n_genes', 'scale_data', etc.
+    graph_params : dict
+        Must contain 'densities' (list) and 'n_repeats' (int).
+    algorithm_params : dict
+        Must contain 'eps' (float). Optionally 'parallel_eps_factor'.
+    debug : bool
+        Passed to GGM_Fitter.
+    seed : int or None
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    df : pandas.DataFrame
+        Results with columns: density, rep, method, time, iterations, logL, reg_param, speedup.
+    """
+    X, S_real, n_obs, reg_used = load_real_data(**data_params)
+    p = S_real.shape[0]
+    densities = graph_params['densities']
+    n_repeats = graph_params['n_repeats']
+    results = []
+
+    for density in densities:
+        n_edges = int(density * p * (p - 1) // 2)
+        for rep in range(n_repeats):
+            if seed is not None:
+                np.random.seed(seed + rep)
+            all_pairs = [(i, j) for i in range(p) for j in range(i+1, p)]
+            selected = np.random.choice(len(all_pairs), n_edges, replace=False)
+            edges = np.array([all_pairs[idx] for idx in selected]).T
+            K_init = np.diag(1.0 / np.maximum(np.diag(S_real), 1e-10))
+
+            # Serial
+            fitter_s = GGM_Fitter(parallel=False, eps=algorithm_params['eps'],
+                                  verbose=False, debug=debug)
+            t0 = time.time()
+            res_s = fitter_s.fit(S_real, edges, n_obs, K_init=K_init.copy())
+            serial_time = time.time() - t0
+
+            # Parallel
+            fitter_p = GGM_Fitter(parallel=True, n_jobs=min(os.cpu_count(), 4),
+                                  eps=algorithm_params['eps'],
+                                  parallel_eps_factor=algorithm_params.get('parallel_eps_factor', 1),
+                                  verbose=False, debug=debug)
+            t0 = time.time()
+            res_p = fitter_p.fit(S_real, edges, n_obs, K_init=K_init.copy())
+            parallel_time = time.time() - t0
+
+            results.append({'density': density, 'rep': rep, 'method': 'serial',
+                            'time': serial_time, 'iterations': res_s['iter'],
+                            'logL': ggm_logL(S_real, res_s['K'], n_obs),
+                            'reg_param': reg_used})
+            results.append({'density': density, 'rep': rep, 'method': 'parallel',
+                            'time': parallel_time, 'iterations': res_p['iter'],
+                            'logL': ggm_logL(S_real, res_p['K'], n_obs),
+                            'reg_param': reg_used,
+                            'speedup': serial_time / parallel_time if parallel_time > 0 else np.nan})
+            del fitter_s, fitter_p
+            gc.collect()
+
+    return pd.DataFrame(results)
+
+
+def analyze_color_group_imbalance(p, edge_index_path,
+                                  ratios=None, seed=42, output_dir="color_analysis"):
+    """
+    Analyze color group sizes for random subsets of a graph and generate a boxplot.
+
+    Parameters
+    ----------
+    p : int
+        Total number of nodes (genes).
+    edge_index_path : str
+        Path to .pt file containing the full edge index (2 x n_edges_full).
+    ratios : list of float, optional
+        Proportions of nodes to sample. Default [0.1, 0.3, 0.5, 0.7, 0.9].
+    seed : int, optional
+        Random seed for reproducibility.
+    output_dir : str, optional
+        Directory to save output files (CSV and boxplot).
+
+    Returns
+    -------
+    df_summary : pandas.DataFrame
+        Summary statistics per ratio.
+    df_detail : pandas.DataFrame
+        Detailed group sizes per color per ratio.
+    """
+    if ratios is None:
+        ratios = [0.1, 0.3, 0.5, 0.7, 0.9]
+    os.makedirs(output_dir, exist_ok=True)
+
+    emat_full = load_real_edges(edge_index_path, p)
+    np.random.seed(seed)
+
+    records = []
+    detail_rows = []
+    all_group_sizes = {}
+
+    for ratio in ratios:
+        n_sel = int(p * ratio)
+        sel_idx = np.random.choice(p, size=n_sel, replace=False)
+        sel_idx.sort()
+        mapping = {orig: new for new, orig in enumerate(sel_idx)}
+
+        sub_edges = []
+        for i in range(emat_full.shape[1]):
+            u, v = int(emat_full[0, i]), int(emat_full[1, i])
+            if u in mapping and v in mapping:
+                sub_edges.append([mapping[u], mapping[v]])
+        if not sub_edges:
+            print(f"Ratio {ratio}: No edges, skipped")
+            continue
+
+        sub_emat = np.array(sub_edges).T
+        n_edges = sub_emat.shape[1]
+        n_vars = n_sel
+
+        color_groups = edge_coloring(sub_emat)
+        n_colors = len(color_groups)
+        group_sizes = [len(v) for v in color_groups.values()]
+        max_size = max(group_sizes)
+        avg_size = np.mean(group_sizes)
+        imbalance = max_size / avg_size if avg_size > 0 else 0
+
+        print(f"Ratio {ratio:.1f}: vars={n_vars}, edges={n_edges}, "
+              f"colors={n_colors}, max={max_size}, avg={avg_size:.1f}, "
+              f"imbalance={imbalance:.2f}")
+
+        records.append({
+            'ratio': ratio,
+            'n_vars': n_vars,
+            'n_edges': n_edges,
+            'n_colors': n_colors,
+            'max_group_size': max_size,
+            'avg_group_size': avg_size,
+            'imbalance_ratio': imbalance
+        })
+
+        for color, edges_in_group in color_groups.items():
+            detail_rows.append({
+                'ratio': ratio,
+                'n_vars': n_vars,
+                'n_edges': n_edges,
+                'color_group': color,
+                'group_size': len(edges_in_group)
+            })
+
+        all_group_sizes[ratio] = group_sizes
+
+    # Save CSV summaries
+    df_summary = pd.DataFrame(records)
+    df_detail = pd.DataFrame(detail_rows)
+    df_summary.to_csv(os.path.join(output_dir, 'color_group_stats.csv'), index=False)
+    df_detail.to_csv(os.path.join(output_dir, 'color_group_details.csv'), index=False)
+
+    # Generate and save boxplot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    box_data = []
+    labels = []
+    for ratio in ratios:
+        if ratio in all_group_sizes:
+            box_data.append(all_group_sizes[ratio])
+            labels.append(f'{ratio * 100:.0f}%')
+    ax.boxplot(box_data, labels=labels, patch_artist=True,
+               boxprops=dict(facecolor='lightblue', edgecolor='black', linewidth=1.2),
+               whiskerprops=dict(linewidth=1.2),
+               capprops=dict(linewidth=1.2),
+               medianprops=dict(linewidth=1.5, color='red'))
+    ax.set_xlabel('Proportion of variables', fontsize=12)
+    ax.set_ylabel('Group size (number of edges)', fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'color_group_boxplot.png'), dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    print(f"\nResults saved to {output_dir}/")
+    print(" - color_group_stats.csv")
+    print(" - color_group_details.csv")
+    print(" - color_group_boxplot.png")
+
+    return df_summary, df_detail

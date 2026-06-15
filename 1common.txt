@@ -1,0 +1,424 @@
+"""
+Public module: Contains common utility functions and the GGM_Fitter class (serial/parallel CovIPS algorithm)
+"""
+import numpy as np
+from sklearn.preprocessing import scale
+import time
+import networkx as nx
+from joblib import Parallel, delayed
+from collections import defaultdict
+import os
+import psutil
+import gc
+
+
+
+
+
+
+# ---------- Basic utility functions ----------
+def safe_inv(A):
+"""
+    Safely compute the inverse of a matrix. For 2x2 matrices, uses analytical formula.
+
+    Parameters
+    ----------
+    A : ndarray
+        Square matrix to invert.
+
+    Returns
+    -------
+    invA : ndarray
+        Inverse or pseudo-inverse of A.
+    """
+    if A.shape == (2, 2):
+        d = A[0,0]*A[1,1] - A[0,1]*A[1,0]
+        if abs(d) < 1e-12:
+            return np.linalg.pinv(A)
+        B = np.zeros((2,2))
+        B[0,0] = A[1,1]
+        B[0,1] = -A[0,1]
+        B[1,0] = -A[1,0]
+        B[1,1] = A[0,0]
+        return B / d
+    else:
+        try:
+            return np.linalg.inv(A)
+        except np.linalg.LinAlgError:
+            return np.linalg.pinv(A)
+
+def fast_cov(x, center=True, scale_data=True):
+"""
+    Fast computation of covariance/correlation matrix.
+
+    Parameters
+    ----------
+    x : ndarray
+        Data matrix (n_samples, n_features).
+    center : bool
+        Whether to center the data.
+    scale_data : bool
+        Whether to scale to unit variance.
+
+    Returns
+    -------
+    cov : ndarray
+        Covariance or correlation matrix.
+    """
+    x_scaled = scale(x, with_mean=center, with_std=scale_data)
+    return x_scaled.T @ x_scaled / (x.shape[0] - 1)
+
+def generate_n01(n_obs, nvar, seed=None):
+"""Generate standard normal random matrix."""
+    if seed is not None:
+        np.random.seed(seed)
+    return np.random.randn(n_obs, nvar)
+
+def ggm_logL(S, K, nobs):
+"""
+    Compute the log-likelihood of a Gaussian graphical model.
+"""
+    sign, logdet = np.linalg.slogdet(K)
+    return nobs * (logdet - np.sum(S * K)) / 2
+
+def monitor_memory():
+"""
+    Monitor current memory usage of the process.
+"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
+
+# ---------- Graph model generation utilities ----------
+def model_saturated(index, type="emat"):
+ """
+    Generate a saturated (complete) graph model.
+
+    Parameters
+    ----------
+    index : list
+        List of node indices.
+    type : str, optional
+        Output type: 'emat' (edge matrix) or 'amat' (adjacency matrix).
+
+    Returns
+    -------
+    emat or amat : ndarray
+        Edge matrix (2 x n_edges) or adjacency matrix (p x p).
+    """
+    pairs = []
+    for i in range(len(index)):
+        for j in range(i+1, len(index)):
+            pairs.append([index[i], index[j]])
+    emat = np.array(pairs).T
+    if type == "emat":
+        return emat
+    elif type == "amat":
+        size = max(index)+1
+        amat = np.zeros((size,size))
+        for i,j in zip(emat[0], emat[1]):
+            amat[i,j] = amat[j,i] = 1
+        return amat
+
+def edge_coloring(edges):
+"""
+    Color edges so that no two adjacent edges share the same color.
+"""
+    G = nx.Graph()
+    for i in range(edges.shape[1]):
+        u,v = edges[0,i], edges[1,i]
+        G.add_edge(u,v)
+    color_dict = {}
+    color_groups = defaultdict(list)
+    sorted_edges = sorted(G.edges(), key=lambda x: -(G.degree(x[0])+G.degree(x[1])))
+    for u,v in sorted_edges:
+        used_colors = set()
+        for nb in G[u]:
+            if (u,nb) in color_dict:
+                used_colors.add(color_dict[(u,nb)])
+            if (nb,u) in color_dict:
+                used_colors.add(color_dict[(nb,u)])
+        for nb in G[v]:
+            if (v,nb) in color_dict:
+                used_colors.add(color_dict[(v,nb)])
+            if (nb,v) in color_dict:
+                used_colors.add(color_dict[(nb,v)])
+        color = 0
+        while color in used_colors:
+            color += 1
+        color_dict[(u,v)] = color
+        color_groups[color].append([u,v])
+    return color_groups
+
+# ---------- GGM fitter: CovIPS algorithm implementation ----------
+class GGM_Fitter:
+ """
+    Gaussian Graphical Model fitter implementing serial and parallel CovIPS algorithms.
+    """
+
+    def __init__(self, max_iter=2000, eps=1e-3, convcrit=1, parallel=False,
+                 n_jobs=4, verbose=False, debug=False, parallel_eps_factor=1,
+                 max_memory_mb=4096):
+        self.max_iter = max_iter
+        self.eps = eps
+        self.parallel_eps_factor = parallel_eps_factor
+        self.convcrit = convcrit
+        self.parallel = parallel
+        self.n_jobs = n_jobs
+        self.color_groups = None
+        self.verbose = verbose
+        self.debug = debug
+        self.max_memory_mb = max_memory_mb
+        self.initial_memory = None
+        self.timing_info = {
+            'total_time': 0,
+            'computation_time': 0,
+            'communication_time': 0,
+            'edge_coloring_time': 0,
+            'iteration_times': []
+        }
+
+    def _memory_check(self, stage=""):
+        if not self.verbose:
+            return
+        current = monitor_memory()
+        if self.initial_memory is None:
+            self.initial_memory = current
+        used = current - self.initial_memory
+        if used > self.max_memory_mb * 0.8:
+            print(f"Warning: High memory usage - {stage}: {used:.1f} MB")
+            gc.collect()
+
+    def fit(self, S, edges, nobs, K_init=None):
+"""
+        Fit the Gaussian graphical model.
+
+        Parameters
+        ----------
+        S : ndarray
+            Empirical covariance matrix.
+        edges : ndarray or list
+            Edge matrix (2 x n_edges) or list of edge tuples.
+        nobs : int
+            Number of observations.
+        K_init : ndarray or None
+            Initial precision matrix. If None, diagonal initialization is used.
+
+        Returns
+        -------
+        result : dict
+            Contains 'K', 'Sigma', 'iter', 'conv_check', and optionally 'timing_info', 'iteration_history'.
+        """
+        self.initial_memory = monitor_memory()
+        p = S.shape[0]
+        if isinstance(edges, list):
+            emat = np.array([[e[0] for e in edges], [e[1] for e in edges]])
+        else:
+            emat = edges
+
+        if K_init is None:
+            if len(edges)==0:
+                K = np.diag(1/np.diag(S))
+                Sigma = np.diag(np.diag(S))
+                return {"K":K, "Sigma":Sigma, "iter":1}
+            elif emat.shape[1] == p*(p-1)//2:
+                K = safe_inv(S)
+                return {"K":K, "Sigma":S, "iter":1}
+            else:
+                K = np.diag(1/np.diag(S))
+                Sigma = np.diag(np.diag(S))
+        else:
+            K = K_init
+            Sigma = safe_inv(K_init)
+
+        if self.parallel:
+            if self.color_groups is None:
+                self.color_groups = edge_coloring(emat)
+            return self._covips_parallel(S, emat, K, Sigma, nobs, self.color_groups)
+        else:
+            return self._covips_serial(S, emat, K, Sigma, nobs)
+
+# ---------- Serial CovIPS ----------
+    def _covips_serial(self, S, emat, K, Sigma, nobs):
+"""
+        Serial CovIPS algorithm.
+
+        Returns
+        -------
+        result : dict
+            Contains 'K', 'Sigma', 'iter', 'conv_check', 'iteration_history'.
+        """
+        start_time = time.time()
+        n_edges = emat.shape[1]
+        logL_prev = ggm_logL(S, K, nobs) if self.convcrit==2 else None
+        K_work = K.copy()
+        Sigma_work = Sigma.copy()
+        other_cache = {}
+        iteration_history = []
+
+        for it in range(self.max_iter):
+            skipped = 0
+            thr = 2*self.eps/nobs
+            for i in range(emat.shape[1]):
+                cc = emat[:,i]
+                S_cc = S[np.ix_(cc,cc)]
+                Sigma_cc = Sigma_work[np.ix_(cc,cc)]
+                if np.max(np.abs(Sigma_cc - S_cc)) < thr:
+                    skipped += 1
+                    continue
+                K_cc = K_work[np.ix_(cc,cc)]
+                K_star = safe_inv(Sigma_cc)
+                L_aux = K_cc - K_star
+                K_update = safe_inv(S_cc) + L_aux
+                K_work[np.ix_(cc,cc)] = K_update
+
+                if tuple(cc) not in other_cache:
+                    other_cache[tuple(cc)] = [i for i in range(Sigma_work.shape[0]) if i not in cc]
+                other = other_cache[tuple(cc)]
+
+                Sigma_cc_old = Sigma_work[np.ix_(cc,cc)]
+                Sigma_ca = Sigma_work[np.ix_(cc,other)]
+                Sigma_ac = Sigma_work[np.ix_(other,cc)]
+                Sigma_aa = Sigma_work[np.ix_(other,other)]
+                inv_Sigma_cc = safe_inv(Sigma_cc_old)
+                temp = S_cc @ inv_Sigma_cc
+                Sigma_work[np.ix_(cc,cc)] = S_cc
+                Sigma_work[np.ix_(cc,other)] = temp @ Sigma_ca
+                Sigma_work[np.ix_(other,cc)] = Sigma_ac @ inv_Sigma_cc @ S_cc
+                H_aux = inv_Sigma_cc - inv_Sigma_cc @ S_cc @ inv_Sigma_cc
+                H_term = Sigma_ac @ H_aux @ Sigma_ca
+                Sigma_work[np.ix_(other,other)] = Sigma_aa - H_term
+
+            if self.convcrit==1:
+                diff = self._max_absolute_deviation(S, Sigma_work, emat)
+                current_logL = ggm_logL(S, K_work, nobs)
+            else:
+                current_logL = ggm_logL(S, K_work, nobs)
+                if it==0:
+                    diff = float('inf')
+                else:
+                    diff = abs(current_logL - logL_prev) / (S.shape[0]+emat.shape[1])
+                logL_prev = current_logL
+
+            iteration_history.append({'iteration':it+1, 'convergence_diff':diff, 'total_iterations':it+1})
+            if diff < 2*self.eps/nobs:
+                break
+
+        K[:] = K_work
+        Sigma[:] = Sigma_work
+        return {"K":K, "Sigma":Sigma, "iter":it+1, "conv_check":diff, "iteration_history":iteration_history}
+
+  # ---------- Parallel CovIPS ----------
+    def _covips_parallel(self, S, emat, K, Sigma, nobs, color_groups):
+"""
+        Parallel CovIPS algorithm with edge coloring.
+
+        Returns
+        -------
+        result : dict
+            Contains 'K', 'Sigma', 'iter', 'conv_check', 'timing_info', 'iteration_history'.
+        """
+        start_time = time.time()
+        color_list = list(color_groups.keys())
+        parallel_eps = 2*self.eps*self.parallel_eps_factor/nobs
+        self.timing_info = {'total_time':0, 'computation_time':0, 'communication_time':0,
+                            'edge_coloring_time':0, 'iteration_times':[], 'color_group_times':[]}
+        K_work = K.copy()
+        Sigma_work = Sigma.copy()
+        initial_logL = ggm_logL(S, K_work, nobs)
+        prev_logL = initial_logL
+        iteration_history = []
+
+        for it in range(self.max_iter):
+            it_start = time.time()
+            for color in color_list:
+                edges_in_color = color_groups[color]
+                K_group_start = K_work.copy()
+                Sigma_group_start = Sigma_work.copy()
+
+                def compute_edge_update(edge):
+                    comp_start = time.time()
+                    cc = edge
+                    S_cc = S[np.ix_(cc,cc)]
+                    Sigma_cc = Sigma_group_start[np.ix_(cc,cc)]
+                    if np.max(np.abs(Sigma_cc - S_cc)) < parallel_eps:
+                        return None, None, None, 0
+                    K_cc = K_group_start[np.ix_(cc,cc)]
+                    K_star = safe_inv(Sigma_cc)
+                    L_aux = K_cc - K_star
+                    K_update = safe_inv(S_cc) + L_aux
+                    H_aux = K_star - K_star @ S_cc @ K_star
+                    comp_time = time.time()-comp_start
+                    return cc, K_update, H_aux, comp_time
+
+                comm_start = time.time()
+                results = Parallel(n_jobs=self.n_jobs, backend="loky", verbose=0)(
+                    delayed(compute_edge_update)(edge) for edge in edges_in_color
+                )
+                comm_time = time.time()-comm_start
+                self.timing_info['communication_time'] += comm_time
+
+                valid = []
+                group_comp = 0
+                for res in results:
+                    if len(res)==4:
+                        cc, Ku, Hu, ct = res
+                        group_comp += ct
+                        if cc is not None:
+                            valid.append((cc, Ku, Hu))
+                self.timing_info['computation_time'] += group_comp
+
+                for cc, Ku, Hu in valid:
+                    K_work[np.ix_(cc,cc)] = Ku
+                    temp = Sigma_group_start[:, cc] @ Hu
+                    Sigma_work -= temp @ Sigma_group_start[cc, :]
+
+                self.timing_info['color_group_times'].append({
+                    'color': color,
+                    'computation_time': group_comp,
+                    'communication_time': comm_time,
+                    'edges_processed': len(edges_in_color),
+                    'edges_skipped': len(edges_in_color)-len(valid)
+                })
+
+            it_time = time.time()-it_start
+            self.timing_info['iteration_times'].append(it_time)
+
+            current_logL = ggm_logL(S, K_work, nobs)
+            if self.convcrit==1:
+                diff = self._max_absolute_deviation(S, Sigma_work, emat)
+            else:
+                if it==0:
+                    diff = abs(current_logL-initial_logL)/(S.shape[0]+emat.shape[1])
+                else:
+                    diff = abs(current_logL-prev_logL)/(S.shape[0]+emat.shape[1])
+                prev_logL = current_logL
+            iteration_history.append({'iteration':it+1, 'convergence_diff':diff, 'total_iterations':it+1})
+
+            if diff < parallel_eps:
+                break
+            if it%20==0:
+                gc.collect()
+                self._memory_check(f"Parallel iteration {it}")
+
+        K[:] = K_work
+        Sigma[:] = Sigma_work
+        total_time = time.time()-start_time
+        self.timing_info['total_time'] = total_time
+        return {
+            "K":K, "Sigma":Sigma, "iter":it+1, "conv_check":diff,
+            "timing_info":self.timing_info.copy(), "iteration_history":iteration_history
+        }
+
+    def _max_absolute_deviation(self, S, Sigma, emat):
+"""
+        Compute the maximum absolute deviation between Sigma and S on vertices and edges.
+"""
+        max_diff = 0.0
+        for i in range(S.shape[0]):
+            diff = abs(Sigma[i,i] - S[i,i])
+            if diff > max_diff: max_diff = diff
+        for i in range(emat.shape[1]):
+            u,v = emat[0,i], emat[1,i]
+            diff = abs(Sigma[u,v] - S[u,v])
+            if diff > max_diff: max_diff = diff
+        return max_diff
