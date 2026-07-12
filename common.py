@@ -47,7 +47,7 @@ def safe_inv(A):
         except np.linalg.LinAlgError:
             return np.linalg.pinv(A)
 
-def fast_cov(x, center=True, scale_data=True):
+def fast_cov(x, center=True, scale_data=False):
 """
     Fast computation of covariance/correlation matrix.
 
